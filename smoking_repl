@@ -1,0 +1,193 @@
+# "Effect or Treatment Heterogeneity? Policy Evaluation with Aggregated and Disaggregated Treatments"
+## Phillip Heiler and Michael C. Knaus
+
+## Scenario 1: Smoking and birth weight
+
+
+# Load required libraries
+library(foreign)
+library(causalDML)
+library(tidyverse)
+library(devtools)
+library(haven)
+
+#Load doubleML package
+library(devtools)
+install_github(repo="MCKnaus/causalDML")
+
+# Load the dataset
+library(here)
+
+file_path <- here("data", "smokingoriginaldataset.dta")
+smoke_data <- read_dta(file_path)
+
+# Set seed
+set.seed(1234)
+
+# STEP 1: Draw a random subsample of 20,000 rows
+
+data <- smoke_data[sample(nrow(smoke_data), 20000), ]
+
+#Now prepare outcome, effective treatment, and confounders as well as the two heterogeneity variables ethnicity and age:
+
+head(data)
+
+# Create main variables
+Y <- as.vector(data[[1]])       #birthweight
+T <- data[[2]]                  #smoking intensity
+X <- as.matrix(data[, 4:53])    # covariates
+
+## Define heterogeneity variables
+# Create categorical variable of ethnicity
+ethnic = rep("Other",length(Y))
+ethnic[X[,2] == 1] = "White"
+ethnic[X[,3] == 1] = "Black"
+ethnic[X[,4] == 1] = "Hispanic"
+ethnic_oh = model.matrix(~0 + ethnic) # One hot coded dummy matrix
+colnames(ethnic_oh) = c("Black","Hispanic","Other","White")
+
+
+
+
+# Age
+
+age = X[,44]
+
+# Decomposition
+
+## Double ML for the effective treatment
+
+# The implementation is based on the *[causalDML](https://github.com/MCKnaus/causalDML)* package that estimates the average potential outcomes and average treatment effects for the multivalued effective treatment. 
+#The nuisance parameters are estimated using an ensemble of methods, which first needs to be initialized.
+#Unlike in the paper with 500k observations where two-fold cross-fitting and -validation is applied or the notebook which use 5-folds each with the 5k sample, we decide to use a subsample of 20k The rest is identical.
+
+
+## Initialize components to be used in the ensemble learner
+# General components
+mean = create_method("mean",name="Mean")
+forest = create_method("forest_grf",name="Forest",args=list(honesty = F,tune.parameters = "all"))
+
+# Pscore specific components
+ridge_bin = create_method("ridge",name="Ridge", args=list(family = "binomial"))
+lasso_bin = create_method("lasso",name="Lasso",args=list(family = "binomial"))
+
+# Outcome specific components
+ridge_ls = create_method("ridge",name="Ridge")
+lasso_ls = create_method("lasso",name="Lasso")
+
+# Run multiple treatment model to get scores 
+
+# it take 4-5 hours on my side
+
+ate = causalDML(Y,T,X,
+                ml_w=list(mean,forest,ridge_bin, lasso_bin),
+                ml_y=list(mean,forest, ridge_ls, lasso_ls),
+                cf=5,cv=5,
+                quiet = FALSE)
+
+# Show results for each effective treatment
+summary(ate$APO)
+summary(ate$ATE)
+plot(ate$APO,label=c("None","1-5 cigs","6-10 cigs","11-15 cigs","16-20 cigs","> 20 cigs"))
+
+
+## Decomposition
+
+#  The decomposition reuses the nuisance parameters and doubly robust scores that are stored in the object created by the *causalDML* function.
+
+### Ethnicity
+
+# This section examines treatment effect heterogeneity by ethnicity.
+# We use one-hot encoded ethnicity indicators and perform decomposition with and without a reference group.
+# The aim is to identify whether average smoking effects differ systematically across ethnic groups.
+
+
+## Decomposition for each subgroup
+# Regression without constant
+decomp_ethnic_woc = HK_decomposition(ate$APO,ethnic_oh,intercept=FALSE)
+summary(decomp_ethnic_woc)
+plot(decomp_ethnic_woc)
+
+
+# With white mothers as reference group
+decomp_ethnic_wc = HK_decomposition(ate$APO,ethnic_oh[,-4],intercept=TRUE)
+summary(decomp_ethnic_wc)
+plot(decomp_ethnic_wc)
+
+### Age
+
+# This section investigates treatment effect heterogeneity by maternal age.
+# We restrict the analysis to mothers aged 15 to 40 and estimate a smooth age-response curve using spline decomposition.
+# The resulting nATE, rATE, and Delta plots allow us to visualize how smoking effects vary across the age spectrum.
+
+
+# Spline
+# Define subset of 15-40 yo
+sub = (age<41 & age>14)
+
+# Run cross-validated spline
+decomp_age_trim = HK_decomposition(ate$APO,age,spline=TRUE, subset = sub)
+
+# Plot resulting lines
+# The nATE curve shows the total observed heterogeneity in the treatment effect by age.
+# We can interpret deviations from zero as evidence of systematic effect variation with age.
+
+pred_nATE = predict(decomp_age_trim, param = "nATE")
+data.frame(z = age[sub],cate = pred_nATE[,1],
+           cilow = pred_nATE[,1] - 1.96 * pred_nATE[,2],
+           ciup = pred_nATE[,1] + 1.96 * pred_nATE[,2]) %>%
+  ggplot(mapping = aes(x = z, y = cate)) +
+  geom_line(linewidth = .8) + geom_hline(yintercept=0) +
+  geom_ribbon(aes(ymin = cilow,max = ciup),alpha=0.3,fill="darkgreen") +
+  theme_bw() + ylab("nATE") + xlab("Age")
+
+# The rATE curve isolates residual treatment effect heterogeneity, i.e., variation not explained by covariates.
+# Significant patterns here suggest that age captures meaningful effect differences beyond observed confounders.
+
+pred_rATE = predict(decomp_age_trim, param = "rATE")
+data.frame(z = age[sub],cate = pred_rATE[,1],
+           cilow = pred_rATE[,1] - 1.96 * pred_rATE[,2],
+           ciup = pred_rATE[,1] + 1.96 * pred_rATE[,2]) %>%
+  ggplot(mapping = aes(x = z, y = cate)) +
+  geom_line(linewidth = .8) + geom_hline(yintercept=0) +
+  geom_ribbon(aes(ymin = cilow,max = ciup),alpha=0.3,fill="darkgreen") +
+  theme_bw() + ylab("rATE") + xlab("Age")
+
+# Delta captures the part of the effect explained by differences in covariate distributions across age.
+# This helps to disentangle structural heterogeneity from compositional differences.
+
+
+pred_Delta = predict(decomp_age_trim, param = "Delta")
+data.frame(z = age[sub],cate = pred_Delta[,1],
+           cilow = pred_Delta[,1] - 1.96 * pred_Delta[,2],
+           ciup = pred_Delta[,1] + 1.96 * pred_Delta[,2]) %>%
+  ggplot(mapping = aes(x = z, y = cate)) +
+  geom_line(linewidth = .8) + geom_hline(yintercept=0) +
+  geom_ribbon(aes(ymin = cilow,max = ciup),alpha=0.3,fill="darkgreen") +
+  theme_bw() + ylab("Delta") + xlab("Age") 
+
+# Additional analysis: impact on low birthweight babies (< 2500g)
+# Here, we explore the association between smoking intensity and the likelihood of low birthweight (< 2500g).
+# The bar chart highlights how heavier smoking is linked to a higher share of low-weight births.
+
+
+# Create binary variable for low birthweight
+low_bw <- as.numeric(Y < 2500)
+
+# Print proportion of low birthweight babies by smoking intensity
+print(prop.table(table(low_bw, T), margin = 2))
+
+# Prepare dataframe for plot
+df <- data.frame(
+  SmokingLevel = factor(T, labels = c("None", "1–5", "6–10", "11–15", "16–20", ">20")),
+  LowBirthweight = factor(low_bw, labels = c("≥ 2500g", "< 2500g"))
+)
+
+# Plot proportion of low birthweight babies for each smoking level
+ggplot(df, aes(x = SmokingLevel, fill = LowBirthweight)) +
+  geom_bar(position = "fill") +
+  labs(
+    title = "Proportion of Low Birthweight (< 2500g) by Smoking Level",
+    y = "Proportion", x = "Smoking Level", fill = "Birthweight"
+  ) +
+  theme_minimal()
