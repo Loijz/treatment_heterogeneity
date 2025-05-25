@@ -1,0 +1,279 @@
+#This codes replicates part 7.2 of the paper using the publicly available data sets that we downloaded from the www.openicpsr.org webpage.
+#They are stored in the zip file called "JobCorps Data files".
+
+
+# DATA PREPARATION
+
+#Load and install doubleML package (no standard R package)
+library(devtools)
+install_github(repo="MCKnaus/causalDML")
+
+#load the required data sub sets
+library(here)
+file_path <- here("data", "impact.sas7bdat")
+file_path1 <- here("data", "key_vars.sas7bdat")
+file_path2 <- here("data", "mileston.sas7bdat")
+file_path3 <- here("data", "baseline.sas7bdat")
+
+library(haven)
+impact_raw <- read_sas(file_path)
+baseline_raw <- read_sas(file_path3)
+key_vars_raw <- read_sas(file_path1)
+mileston_raw <- read_sas(file_path2)
+
+
+
+
+# DATA PREPARATION
+library(causalDML)
+library(sas7bdat)
+library(tidyverse)
+
+set.seed(1234)
+
+# raw data
+impact_raw <- impact
+baseline_raw <- baseline
+key_vars_raw <- key_vars
+mileston_raw <- mileston
+
+# extract relevant variables
+impact <- select(impact_raw, mprid = MPRID, earn_y4 = EARNY4, ever_jc = EVERJCH)
+impact_temp <- select(impact_raw, mprid = MPRID, jc_clerical = JCVCLERC, jc_health = JCVHLTH,
+                      jc_auto = JCVAUTO, jc_weld = JCVWELD, jc_electric1 = JCVELTRC,
+                      jc_construct = JCVCSTRC, jc_food = JCVFOOD, jc_electronic = JCVETRNC,
+                      jc_other = JCVOTH)
+
+baseline <- select(baseline_raw, mprid = MPRID, race_eth = RACE_ETH, hs_d = HS_D, ged_d = GED_D,
+                   voc_d = VOC_D, any_ed1 = ANY_ED1, hgc = HGC, ntv_lang = NTV_LANG, wkearnr = WKEARNR,
+                   has_child = HASCHLD, marriage = MARRIAGE, r_head = R_HEAD, hh_memb = HHMEMB,
+                   health = HEALTH, py_cig = PY_CIG, py_alchl = PY_ALCHL, py_pot = PY_POT,
+                   had_worry = HADWORRY, hear_jc = HEAR_JC, knew_cntr = KNEWCNTR,
+                   e_math = E_MATH, e_read = E_READ, e_along = E_ALONG, e_contrl = E_CONTRL,
+                   e_esteem = E_ESTEEM, e_spcjob = E_SPCJOB, e_friend = E_FRIEND, knew_jc = KNEW_JC,
+                   earn_yr = EARN_YR)
+
+key_vars <- select(key_vars_raw, mprid = MPRID, treatmnt = TREATMNT, female = FEMALE,
+                   age_cat = AGE_CAT, educ_gr = EDUC_GR, nonres = NONRES)
+
+mileston <- select(mileston_raw, mprid = MPRID, live_spou = LIVESPOU, ever_work = EVERWORK,
+                   yr_work = YR_WORK, curr_job = CURRJOB, job0_3 = JOB0_3, job3_9 = JOB3_9,
+                   job9_12 = JOB9_12, most_welf = MOSTWELF, got_afdc = GOT_AFDC, got_fs = GOT_FS,
+                   ed0_6 = ED0_6, ed6_12 = ED6_12, public_h = PUBLICH, bad_hlth = BADHLTH,
+                   hard_use = HARDUSE, pot_use = POTUSE, ev_arrest = EVARRST, pmsa = PMSA,
+                   msa = MSA, prarri = PRARRI)
+
+# coding the versions
+versions <- rep("Nothing", nrow(impact))
+versions[impact_temp$jc_clerical == 1] <- "Clerical"
+versions[impact_temp$jc_health == 1] <- "Health"
+versions[impact_temp$jc_auto == 1] <- "Auto"
+versions[impact_temp$jc_weld == 1] <- "Welding"
+versions[impact_temp$jc_electric1 == 1 | impact_temp$jc_electronic == 1] <- "Electrical"
+versions[impact_temp$jc_construct == 1] <- "Construction"
+versions[impact_temp$jc_food == 1] <- "Food"
+versions[impact_temp$jc_other == 1] <- "Other"
+versions[rowSums(impact_temp[, -1], na.rm = TRUE) > 1] <- "Multiple"
+impact$versions <- versions
+
+# merge data and drop NAs
+db <- impact %>%
+  inner_join(baseline, by = "mprid") %>%
+  inner_join(key_vars, by = "mprid") %>%
+  inner_join(mileston, by = "mprid") %>%
+  mutate(
+    race_w = as.numeric(race_eth == 1),
+    race_b = as.numeric(race_eth == 2),
+    race_h = as.numeric(race_eth == 3),
+    race_o = as.numeric(race_eth == 4),
+    wkearnr = replace_na(wkearnr, 0),
+    earn_yr = replace_na(earn_yr, 0)
+  ) %>%
+  drop_na()
+
+# reduce sample size (if wished)
+set.seed(123)
+
+# First, check how many units are in each treatment group
+db %>%
+  group_by(treatmnt) %>%
+  summarise(count = n())
+
+# Perform sampling to ensure that all treatment groups are adequately represented
+# Ensure each group is sampled proportionally to its size
+db <- db %>%
+  group_by(treatmnt) %>%
+  slice_sample(prop = 20000 / n()) %>%  
+  ungroup()
+
+# A check to see how many units are now in each treatment group after sampling
+db %>%
+  group_by(treatmnt) %>%
+  summarise(count = n())
+
+# variables
+y <- as.matrix(db$earn_y4)
+d <- as.matrix(db$treatmnt)
+
+# Treatment label
+jc <- db$ever_jc
+treat_label <- case_when(
+  d == 0 ~ "Control",
+  d == 1 & jc == 0 ~ "No JC",
+  d == 1 & jc == 1 & db$versions == "Clerical" ~ "Clerical",
+  d == 1 & jc == 1 & db$versions == "Health" ~ "Health",
+  d == 1 & jc == 1 & db$versions == "Auto" ~ "Auto",
+  d == 1 & jc == 1 & db$versions == "Welding" ~ "Welding",
+  d == 1 & jc == 1 & db$versions == "Electrical" ~ "Electrical",
+  d == 1 & jc == 1 & db$versions == "Construction" ~ "Construction",
+  d == 1 & jc == 1 & db$versions == "Food" ~ "Food",
+  d == 1 & jc == 1 & db$versions == "Other" ~ "Other",
+  d == 1 & jc == 1 & db$versions == "Multiple" ~ "Multiple",
+  TRUE ~ "JC without voc"
+)
+treat_label <- factor(treat_label, levels = c("Control", "No JC", "JC without voc", "Clerical", "Health", "Auto",
+                                              "Welding", "Electrical", "Construction", "Food", "Other", "Multiple"))
+
+# matrix of covariates
+x_main <- select(db, female, age_cat, race_w, race_b, race_h, race_o, educ_gr, live_spou,
+                 ever_work, yr_work, curr_job, job0_3, job3_9, job9_12, most_welf, got_afdc,
+                 got_fs, ed0_6, ed6_12, public_h, bad_hlth, hard_use, pot_use, ev_arrest, pmsa,
+                 msa, hs_d, ged_d, voc_d, any_ed1, hgc, ntv_lang, wkearnr, has_child, marriage,
+                 r_head, hh_memb, health, py_cig, py_alchl, py_pot, had_worry, hear_jc, knew_cntr,
+                 e_math, e_read, e_along, e_contrl, e_esteem, e_spcjob, e_friend, knew_jc, nonres,
+                 prarri, earn_yr)
+
+x <- design_matrix(as.matrix(x_main), int = colnames(x_main), int_d = 2)
+x <- data_screen(x, print = FALSE)
+main_effects <- !grepl(":", colnames(x))
+
+# define the method
+mean_method <- create_method("mean", name = "Mean")
+forest_method <- create_method("forest_grf", name = "Forest", x_select = main_effects,
+                               args = list(honesty = FALSE, tune.parameters = "all", seed = 123))
+
+ridge_bin_low <- create_method("ridge", name = "Ridge low", family = "binomial",
+                               x_select = main_effects, args = list(lambda.min.ratio = 0.001))
+lasso_bin_low <- create_method("lasso", name = "Lasso low", family = "binomial",
+                               x_select = main_effects, args = list(lambda.min.ratio = 0.01))
+ridge_bin_high <- create_method("ridge", name = "Ridge high", family = "binomial",
+                                args = list(lambda.min.ratio = 0.01))
+lasso_bin_high <- create_method("lasso", name = "Lasso high", family = "binomial",
+                                args = list(lambda.min.ratio = 0.05))
+
+ridge_ls_low <- create_method("ridge", name = "Ridge low", x_select = main_effects,
+                              args = list(lambda.min.ratio = 0.0001))
+lasso_ls_low <- create_method("lasso", name = "Lasso low", x_select = main_effects,
+                              args = list(lambda.min.ratio = 0.001))
+ridge_ls_high <- create_method("ridge", name = "Ridge high", args = list(lambda.min.ratio = 0.05))
+lasso_ls_high <- create_method("lasso", name = "Lasso high", args = list(lambda.min.ratio = 0.05))
+
+# ---------------------------------------------
+# RUN CAUSAL DML – Toggle between single model vs. ensemble
+# ---------------------------------------------
+
+# Option 1: Use only Forest model
+# Uncomment below to use single model
+#set.seed(123)
+# ate <- causalDML(y, treat_label, x,
+#                  ml_w = list(forest_method),
+#                  ml_y = list(forest_method),
+#                  quiet = FALSE)
+
+# Option 2: Use ensemble of methods (default)
+# Uncomment below to use full ensemble
+ate <- causalDML(y, treat_label, x,
+                 ml_w = list(mean_method, forest_method,
+                             ridge_bin_low, lasso_bin_low,
+                             ridge_bin_high, lasso_bin_high),
+                 ml_y = list(mean_method, forest_method,
+                             ridge_ls_low, lasso_ls_low,
+                             ridge_ls_high, lasso_ls_high),
+                 quiet = FALSE)
+
+# results
+summary(ate$APO)
+plot(ate$APO)
+View(ate$APO)
+
+# DECOMPOSITION FOR EACH SUBGROUP (GENDER)
+
+# Regressions with and without constant
+cat("Without constant:\n")
+decomp_female_woc <- HK_decomposition(ate$APO, fem_mat, intercept = FALSE)
+summary(decomp_female_woc)
+
+cat("\n\nWith constant:\n")
+female_vec <- pull(female)  # Extract as vector if necessary
+decomp_female_wc <- HK_decomposition(ate$APO, female_vec, intercept = TRUE)
+summary(decomp_female_wc)
+
+# extract coefficients
+coef_fem <- c(
+  decomp_female_woc$nATE$results[1,1],
+  decomp_female_woc$Delta$results[1,1],
+  decomp_female_woc$rATE$results[1,1],
+  decomp_female_woc$nATE$results[2,1],
+  decomp_female_woc$Delta$results[2,1],
+  decomp_female_woc$rATE$results[2,1],
+  decomp_female_wc$nATE$results[2,1],
+  decomp_female_wc$Delta$results[2,1],
+  decomp_female_wc$rATE$results[2,1]
+)
+
+# extract p-values
+pv_fem <- c(
+  decomp_female_woc$nATE$results[1,4],
+  decomp_female_woc$Delta$results[1,4],
+  decomp_female_woc$rATE$results[1,4],
+  decomp_female_woc$nATE$results[2,4],
+  decomp_female_woc$Delta$results[2,4],
+  decomp_female_woc$rATE$results[2,4],
+  decomp_female_wc$nATE$results[2,4],
+  decomp_female_wc$Delta$results[2,4],
+  decomp_female_wc$rATE$results[2,4]
+)
+
+# Waterfall base values (start, ending)
+start0 <- c(0, coef_fem[1], coef_fem[3])
+end0   <- c(coef_fem[1], coef_fem[3], 0)
+start1 <- c(0, coef_fem[4], coef_fem[6])
+end1   <- c(coef_fem[4], coef_fem[6], 0)
+start2 <- c(0, coef_fem[7], coef_fem[9])
+end2   <- c(coef_fem[7], coef_fem[9], 0)
+
+# formatting
+coef_fem_fmt <- format(coef_fem, digits = 2)
+pv_fem_fmt <- paste0("(", sprintf("%.3f", pv_fem), ")")
+
+
+# Data for the plot
+df_plot <- data.frame(
+  id = c(1:3, 1:3, 1:3),
+  Estimand = factor(
+    c("nATE", "Delta", "rATE", "nATE", "Delta", "rATE", "nATE", "Delta", "rATE"),
+    levels = c("nATE", "Delta", "rATE")
+  ),
+  Gender = factor(
+    c(rep("Male", 3), rep("Female", 3), rep("Difference Female - Male", 3)),
+    levels = c("Female", "Male", "Difference Female - Male")
+  ),
+  start = c(start0, start1, start2),
+  end = c(end0, end1, end2),
+  coef = coef_fem_fmt,
+  pvalue = pv_fem_fmt
+)
+
+# plots
+ggplot(df_plot, aes(id, fill = Estimand, group = Gender)) +
+  geom_rect(aes(xmin = id - 0.5, xmax = id + 0.5, ymin = end, ymax = start)) +
+  scale_fill_brewer(palette = "Dark2") +
+  ylab("Effect") +
+  scale_x_continuous(breaks = c(1, 2, 3), labels = c("nATE", expression(Delta), "rATE")) +
+  theme_bw() +
+  geom_hline(yintercept = 0) +
+  xlab("Estimand") +
+  theme(legend.position = "none") +
+  geom_text(aes(x = id, y = (start + end + 1.25) / 2, label = coef), size = 2.75) +
+  geom_text(aes(x = id, y = (start + end - 1.25) / 2, label = pvalue), size = 2.75) +
+  facet_wrap(~Gender)
