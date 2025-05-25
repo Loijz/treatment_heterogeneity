@@ -1,0 +1,432 @@
+
+
+library(dplyr)
+library(haven)
+library(causalDML)
+library(grf)
+library(mlr3)
+library(mlr3learners)
+library(tibble)
+library(ggplot2)
+library(tidyverse)
+
+
+# You can download the dataset under: https://www.cdc.gov/brfss/annual_data/annual_2020.html -> File Name: 2020 BRFSS Data (SAS Transport Format) 
+# Load dataset, The path needs to be adapted to where your datafile is located. 
+file_path <- file.path("C:/MSC/M03 Applied Econometrics/group-project-thedatadetectives/repo copy/code/LLCP2020.XPT/LLCP2020.XPT")
+data_orig <- read_xpt(file_path)
+data <- data_orig
+# View first few rows
+head(data)
+
+colnames(data)
+
+#smaller size of df, for faster computing, dont compute this line or change number for more n
+#data <- data_orig[sample(nrow(data_orig), 100000), ]
+
+
+
+# Select relevant variables and clean
+brfss_clean <- data %>%
+  select(
+    SLEPTIM1,       # Hours of sleep per night
+    ADDEPEV3,       # Diagnosed with depression (1 = Yes, 2 = No)
+    `_AGE80`,       # Age (0–80)
+    `_BMI5`,        # BMI * 100
+    SMOKE100,       # Smoked at least 100 cigarettes (1 = Yes)
+    EXERANY2,       # Any physical activity in past 30 days (1 = Yes)
+    SEXVAR,         # Sex (1 = Male, 2 = Female)
+    MARITAL,        # Marriage status
+    EMPLOY1,        # Employment status
+    DRNK3GE5        # Bingedrinking
+  ) %>%
+  mutate(
+    LackOfSleep = if_else(SLEPTIM1 < 6, 1, 0),                    # Binary treatment: 1 = <6h sleep
+    HadDepressiveDisorder = if_else(ADDEPEV3 == 1, 1, 0),         # Binary outcome: 1 = diagnosed
+    AGE = as.numeric(`_AGE80`),                                   # Convert age to numeric
+    BMI = as.numeric(`_BMI5`) / 100,                              # Convert BMI to scale (e.g. 2345 → 23.45)
+    SEX = as.factor(SEXVAR),                                      # Factor for categorical variable
+    SMOKE100 = as.factor(SMOKE100),                               # Factor (Yes/No for smoking)
+    ACTIVE = as.factor(EXERANY2),                                 # Rename physical activity variable
+    MARRIAGE = if_else(MARITAL %in% c(1, 6), 1, 0),               # Convert Marriage and unmarried couple to 1, all other status 0
+    EMPLOYED = if_else(EMPLOY1 %in% c(1, 2), 1, 0),
+    DRINKS = if_else(DRNK3GE5 == 88, 1, 
+                     if_else(!is.na(DRNK3GE5), 2, NA_real_))
+  ) %>%
+  filter(
+    SLEPTIM1 <= 10
+  ) %>%
+  drop_na()                                                       # Remove rows with any missing values
+
+head(brfss_clean)
+
+#erasing redundant variables
+brfss_clean <- brfss_clean %>%
+  select(
+    SLEPTIM1,
+    LackOfSleep,
+    AGE,
+    BMI,
+    SEX,
+    SMOKE100,
+    ACTIVE,
+    MARRIAGE,
+    EMPLOYED,
+    DRINKS,
+    HadDepressiveDisorder
+  )
+
+#Factorization of confounders
+brfss_clean$DRINKS <- as.factor(brfss_clean$DRINKS)
+brfss_clean$SLEPTIM1 <- as.factor(brfss_clean$SLEPTIM1)
+
+# Fit a logistic regression model to predict Y (HadDepressiveDisorder) to have a propensity score as an outcome instead of a binary outcome
+propensity_model <- glm(
+  HadDepressiveDisorder ~ SLEPTIM1 + LackOfSleep + AGE + BMI + SEX +
+    SMOKE100 + ACTIVE + MARRIAGE + EMPLOYED + DRINKS,
+  data = brfss_clean,
+  family = binomial()
+)
+
+# Predict the propensity score (probability of Y = 1)
+brfss_clean <- brfss_clean %>%
+  mutate(
+    propensity_score = predict(propensity_model, type = "response"),
+    propensity_score_100 = round(propensity_score * 100, 2)  # scaled to 0–100
+  )
+
+#Checking if table is correct format and if there are no NA
+head(brfss_clean)
+sum(!complete.cases(brfss_clean))
+
+#Visualization of the distributionratio of Treated and Non-Treated observations
+summary(brfss_clean$LackOfSleep)
+hist(brfss_clean$LackOfSleep)
+
+
+#Creating bins for Age, as subgroups on each year is overwhelming
+brfss_clean <- brfss_clean %>%
+  mutate(AGE_DEC = case_when(
+    AGE <= 25 ~ "under 25 years",
+    AGE >= 26 & AGE <= 49 ~ "26 - 49 years",
+    AGE >= 50 ~ "50 or older"
+  ))
+brfss_clean$AGE_DEC <- factor(
+  brfss_clean$AGE_DEC,
+  levels = c("under 25 years", "26 - 49 years", "50 or older")
+)
+
+#Checking of age distribution
+head(brfss_clean)
+head(brfss_clean$AGE_DEC, 20)
+ggplot(brfss_clean, aes(x = AGE_DEC)) +
+  geom_bar(fill = "skyblue", color = "black") +
+  labs(
+    title = "Count of Observations by Age Group",
+    x = "Age Group (AGE_DEC)",
+    y = "Count"
+  ) +
+  theme_minimal()
+
+#Creating Y, T and X for DML
+Y <- brfss_clean$propensity_score #Outcome as a propensity score
+T <- brfss_clean$SLEPTIM1 #Treatment 1-10hrs
+X <- brfss_clean %>%
+  select(-SLEPTIM1, -HadDepressiveDisorder, -propensity_score_100, -propensity_score, -LackOfSleep, -AGE_DEC)
+
+X <- X %>%
+  mutate(
+    SEX = ifelse(SEX == 1, 0, ifelse(SEX == 2, 1, NA)),
+    SMOKE100 = ifelse(SMOKE100 == 1, 1, 0),
+    ACTIVE = ifelse(ACTIVE == 1, 1, 0)
+  )
+
+# Ensure X is a numeric matrix
+X <- as.data.frame(X)
+X[] <- lapply(X, as.numeric)  # Convert all columns to numeric
+X <- as.matrix(X)             # Convert to matrix
+
+# Ensure Y and T are numeric vectors
+Y <- as.numeric(Y)
+T <- as.numeric(T)
+
+
+
+df <- data.frame(Y = Y, T = T, X)
+
+
+
+#Checking for NA or mistakes in the dataframe
+sum(!complete.cases(df))
+head(df, 50)
+
+
+
+## Define heterogeneity variables
+mean = create_method("mean",name="Mean")
+forest = create_method("forest_grf",name="Forest",args=list(honesty = F,tune.parameters = "all"))
+
+# Pscore specific components
+ridge_bin = create_method("ridge",name="Ridge", args=list(family = "binomial"))
+lasso_bin = create_method("lasso",name="Lasso",args=list(family = "binomial"))
+
+# Outcome specific components
+ridge_ls = create_method("ridge",name="Ridge")
+lasso_ls = create_method("lasso",name="Lasso")
+
+# Run multiple treatment model to get scores
+ate = causalDML(Y,T,X,
+                ml_w=list(mean, ridge_bin,lasso_bin),
+                ml_y=list(mean, ridge_ls,lasso_ls),
+                cf=2,cv=2,
+                quiet = FALSE)
+
+# Run multiple treatment model to get scores, untick if you want to run with forest (longer)
+#ate = causalDML(Y,T,X,
+#                ml_w=list(mean, forest, ridge_bin,lasso_bin),
+#                ml_y=list(mean, forest, ridge_ls,lasso_ls),
+#                cf=5,cv=5,
+#                quiet = FALSE)
+
+
+# Show results for each effective treatment
+summary(ate$APO)
+summary(ate$ATE)
+plot(ate$APO)
+summary(ate$APO)
+
+
+
+
+str(brfss_clean$AGE_DEC)
+levels(brfss_clean$AGE_DEC)
+table(brfss_clean$AGE_DEC)
+
+# Create a binary indicator based on T
+T_new <- brfss_clean$LackOfSleep
+
+## Decomposition for each subgroup
+# Regression without constant
+decomp_AGE = HK_decomposition(ate$APO, brfss_clean$AGE_DEC, group = T_new, intercept=FALSE)
+summary(decomp_AGE)
+
+plot(decomp_AGE) +
+  ggtitle("Comparison of subgroup: Age")
+
+#robustness check for delta in subgroup AGE
+#As the Delta between subgroup does not show a lot of variation, we will check the sleep hours distribution 
+#between groups
+#They should, in this case be evenly distributed.
+
+# Create a numeric version of SLEPTIM1
+brfss_clean <- brfss_clean %>%
+  mutate(SLEPTIM2 = as.numeric(as.character(SLEPTIM1)))
+
+# Filter to sensible sleep values
+brfss_filtered <- brfss_clean %>%
+  filter(SLEPTIM2 >= 1, SLEPTIM2 <= 10)
+
+# Calculate percentage distribution within each age group
+sleep_dist <- brfss_filtered %>%
+  group_by(AGE_DEC, SLEPTIM2) %>%
+  summarise(n = n(), .groups = 'drop') %>%
+  group_by(AGE_DEC) %>%
+  mutate(percent = n / sum(n) * 100)
+
+# Create the plot with bars and lines
+ggplot(sleep_dist, aes(x = factor(SLEPTIM2), y = percent, fill = AGE_DEC)) +
+  geom_bar(stat = "identity", position = "dodge", color = "black") +
+  geom_line(aes(group = AGE_DEC, color = AGE_DEC), 
+            size = 1.2, 
+            stat = "summary", 
+            fun = "mean", 
+            position = position_dodge(width = 0.8)) + 
+  labs(
+    title = "Relative Sleep Hour Distribution by Age Group",
+    x = "Hours of Sleep",
+    y = "Percentage within Age Group",
+    fill = "Age Group",
+    color = "Age Group"
+  ) +
+  scale_fill_manual(values = c("skyblue", "orange", "darkgreen")) +
+  scale_color_manual(values = c("skyblue", "orange", "darkgreen")) +
+  theme_minimal()
+
+#We can see, all curves follow the same pattern, therefore the Delta-Variation is trustful. 
+
+
+
+
+# Force AGE to a numeric vector
+z <- as.numeric(df$AGE)
+
+# Create a valid subset (e.g., for age between 15 and 40)
+sub <- z > 10 & z < 80
+
+# Run the decomposition without spline first to simplify
+decomp_spline_AGE <- HK_decomposition(ate$APO, z, subset = sub, spline = FALSE)
+
+
+
+
+# Plot resulting lines
+pred_nATE = predict(decomp_spline_AGE, param = "nATE")
+data.frame(z = z[sub],cate = pred_nATE[,1],
+           cilow = pred_nATE[,1] - 1.96 * pred_nATE[,2],
+           ciup = pred_nATE[,1] + 1.96 * pred_nATE[,2]) %>%
+  ggplot(mapping = aes(x = z, y = cate)) +
+  geom_line(size = .8) + geom_hline(yintercept=0) +
+  geom_ribbon(aes(ymin = cilow,max = ciup),alpha=0.3,fill="darkgreen") +
+  theme_bw() + ylab("nATE") + xlab("Age")
+
+pred_rATE = predict(decomp_spline_AGE, param = "rATE")
+data.frame(z = z[sub],cate = pred_rATE[,1],
+           cilow = pred_rATE[,1] - 1.96 * pred_rATE[,2],
+           ciup = pred_rATE[,1] + 1.96 * pred_rATE[,2]) %>%
+  ggplot(mapping = aes(x = z, y = cate)) +
+  geom_line(size = .8) + geom_hline(yintercept=0) +
+  geom_ribbon(aes(ymin = cilow,max = ciup),alpha=0.3,fill="darkgreen") +
+  theme_bw() + ylab("rATE") + xlab("Age")
+
+pred_Delta = predict(decomp_spline_AGE, param = "Delta")
+data.frame(z = z[sub],cate = pred_Delta[,1],
+           cilow = pred_Delta[,1] - 1.96 * pred_Delta[,2],
+           ciup = pred_Delta[,1] + 1.96 * pred_Delta[,2]) %>%
+  ggplot(mapping = aes(x = z, y = cate)) +
+  geom_line(size = .8) + geom_hline(yintercept=0) +
+  geom_ribbon(aes(ymin = cilow,max = ciup),alpha=0.3,fill="darkgreen") +
+  theme_bw() + ylab("Delta") + xlab("Age")
+
+## Decomposition for each subgroup
+# Regression without constant
+brfss_clean$SEX <- factor(brfss_clean$SEX, levels = c(1, 2), labels = c("Male", "Female"))
+
+decomp_SEX = HK_decomposition(ate$APO, brfss_clean$SEX, group = T_new, intercept=FALSE)
+summary(decomp_SEX)
+plot(decomp_SEX) +
+  ggtitle("Comparison of subgroups: Gender")
+
+## Decomposition for each subgroup
+# Regression without constant
+brfss_clean$DRINKS <- factor(brfss_clean$DRINKS, levels = c(1, 2), labels = c("Yes", "No"))
+decomp_DRINKS= HK_decomposition(ate$APO, brfss_clean$DRINKS, group = T_new, intercept=FALSE)
+summary(decomp_DRINKS)
+plot(decomp_DRINKS) + 
+  ggtitle("Comparison of subgroups: People that are drinking more than 6 drinks on a single day per month")
+
+
+
+## Decomposition for each subgroup
+# Regression without constant
+
+brfss_clean$BMI_dec <- cut(
+  brfss_clean$BMI,
+  breaks = c(-Inf, 18.5, 24.9, 29.9, Inf),
+  labels = c("underweight", "normalweight", "overweight", "strongly overweighted"),
+  right = TRUE
+)
+
+# Convert to factor (this is technically already a factor from cut(), but good to be explicit)
+brfss_clean$BMI_dec <- as.factor(brfss_clean$BMI_dec)
+
+# Optional: check the distribution
+table(brfss_clean$BMI_dec)
+
+decomp_BMI= HK_decomposition(ate$APO, brfss_clean$BMI_dec, group = T_new, intercept=FALSE)
+summary(decomp_BMI)
+plot(decomp_BMI) +
+  ggtitle("Comparison of subgroups: BMI")
+
+sub_bmi <- z > 15 & z < 30
+
+# Run the decomposition without spline first to simplify
+decomp_spline_bmi <- HK_decomposition(ate$APO, z, subset = sub_bmi, spline = FALSE)
+
+
+
+
+# Plot resulting lines Spline BMI
+pred_nATE = predict(decomp_spline_bmi, param = "nATE")
+data.frame(z = z[sub_bmi],cate = pred_nATE[,1],
+           cilow = pred_nATE[,1] - 1.96 * pred_nATE[,2],
+           ciup = pred_nATE[,1] + 1.96 * pred_nATE[,2]) %>%
+  ggplot(mapping = aes(x = z, y = cate)) +
+  geom_line(size = .8) + geom_hline(yintercept=0) +
+  geom_ribbon(aes(ymin = cilow,max = ciup),alpha=0.3,fill="darkgreen") +
+  theme_bw() + ylab("nATE") + xlab("Age")
+
+pred_rATE = predict(decomp_spline_bmi, param = "rATE")
+data.frame(z = z[sub_bmi],cate = pred_rATE[,1],
+           cilow = pred_rATE[,1] - 1.96 * pred_rATE[,2],
+           ciup = pred_rATE[,1] + 1.96 * pred_rATE[,2]) %>%
+  ggplot(mapping = aes(x = z, y = cate)) +
+  geom_line(size = .8) + geom_hline(yintercept=0) +
+  geom_ribbon(aes(ymin = cilow,max = ciup),alpha=0.3,fill="darkgreen") +
+  theme_bw() + ylab("rATE") + xlab("Age")
+
+pred_Delta = predict(decomp_spline_bmi, param = "Delta")
+data.frame(z = z[sub_bmi],cate = pred_Delta[,1],
+           cilow = pred_Delta[,1] - 1.96 * pred_Delta[,2],
+           ciup = pred_Delta[,1] + 1.96 * pred_Delta[,2]) %>%
+  ggplot(mapping = aes(x = z, y = cate)) +
+  geom_line(size = .8) + geom_hline(yintercept=0) +
+  geom_ribbon(aes(ymin = cilow,max = ciup),alpha=0.3,fill="darkgreen") +
+  theme_bw() + ylab("Delta") + xlab("Age")
+
+
+#robustness check - 
+#With the following code you can reproduce the CausalDML and HK_decomposition with
+#randomly assigned effective treatment. When delta is zero or almost zero, the Dataset has robust variables 
+#that work with the decomposition and are proofing, that the HK_decomposition is working. 
+
+
+# Get original treatment levels and their counts
+T_levels <- as.character(brfss_clean$SLEPTIM1)
+T_counts <- table(T_levels)
+
+# Create a new vector with same counts per level, but shuffled
+set.seed(123)  # For reproducibility
+T_random <- sample(rep(names(T_counts), T_counts))
+
+# Assign as numeric treatment variable
+T <- as.numeric(T_random)
+
+# Run multiple treatment model to get scores
+ate = causalDML(Y,T,X,
+                ml_w=list(mean, ridge_bin,lasso_bin),
+                ml_y=list(mean, ridge_ls,lasso_ls),
+                cf=2,cv=2,
+                quiet = FALSE)
+
+# Run multiple treatment model to get scores, untick if you want to run with forest (longer)
+#ate = causalDML(Y,T,X,
+#                ml_w=list(mean, forest, ridge_bin,lasso_bin),
+#                ml_y=list(mean, forest, ridge_ls,lasso_ls),
+#                cf=5,cv=5,
+#                quiet = FALSE)
+
+
+# Show results for each effective treatment
+summary(ate$APO)
+summary(ate$ATE)
+plot(ate$APO)
+summary(ate$APO)
+
+
+
+
+str(brfss_clean$AGE_DEC)
+levels(brfss_clean$AGE_DEC)
+table(brfss_clean$AGE_DEC)
+treated_levels = c(1, 2, 3, 4, 5)  # These will be considered "treated"
+
+# Create a binary indicator based on T
+T_new = ifelse(T %in% treated_levels, 1, 0)
+
+## Decomposition for each subgroup
+# Regression without constant
+decomp_AGE = HK_decomposition(ate$APO, brfss_clean$AGE_DEC, group = T_new, intercept=FALSE)
+summary(decomp_AGE)
+
+plot(decomp_AGE) +
+  ggtitle("Comparison of subgroup: Age")
